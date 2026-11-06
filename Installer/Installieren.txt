@@ -1,0 +1,26 @@
+SpaceClose installieren
+
+1. Falls SpaceClose schon läuft: über sein Menü beenden.
+2. SpaceClose.app auf den Ordner „Programme“ in diesem Fenster ziehen.
+   Für einen anderen Installationsort die App in den gewünschten Ordner
+   im Finder ziehen. Die App ist ein vollständiges, verschiebbares Paket.
+3. Bei einem Update die vorhandene Kopie am gewählten Ort ersetzen.
+4. Das Laufwerk „SpaceClose“ im Finder auswerfen.
+5. SpaceClose vom gewählten Installationsort aus öffnen.
+
+Für die normale Installation ist /Applications (Programme) empfohlen.
+Starte die App nach dem Kopieren, nicht direkt von diesem Laufwerk.
+
+Bedienungshilfen
+
+Falls SpaceClose noch keinen Zugriff hat, unter Systemeinstellungen →
+Datenschutz & Sicherheit → Bedienungshilfen die installierte Kopie erlauben.
+Der Installer selbst setzt keine Rechte und aktiviert keinen Autostart.
+Die Freigabe muss für die App am endgültigen Installationsort gelten.
+
+Lokale Testversion
+
+Diese Ausgabe enthält die App-Version @VERSION@. Der frühere
+Paket-Installer wurde durch dieses einfache Ziehen-und-Ablegen ersetzt.
+Die App ist lokal signiert; es gibt keine Apple-Notarisierung. Offene
+Fragen zur Vollbildleiste sind durch das neue Verpackungsformat nicht behoben.

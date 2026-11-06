@@ -1,0 +1,803 @@
+--- a/Info.plist
++++ b/Info.plist
+@@ -7,8 +7,8 @@
+   <key>CFBundleExecutable</key><string>SpaceClose</string>
+   <key>CFBundleIconFile</key><string>SpaceClose</string>
+   <key>CFBundlePackageType</key><string>APPL</string>
+-  <key>CFBundleShortVersionString</key><string>0.5.0</string>
+-  <key>CFBundleVersion</key><string>7</string>
++  <key>CFBundleShortVersionString</key><string>0.5.1</string>
++  <key>CFBundleVersion</key><string>8</string>
+   <key>LSMinimumSystemVersion</key><string>13.0</string>
+   <key>LSUIElement</key><true/>
+   <key>NSHighResolutionCapable</key><true/>
+--- a/Sources/Dialogs.swift
++++ b/Sources/Dialogs.swift
+@@ -4,70 +4,101 @@
+ struct BlockingDialog {
+     let element: AXUIElement
+     let window: AXUIElement
++    var focusedSemantic = false
+     var id: UInt { CFHash(element) }
+ }
+ 
+-struct DialogBaseline {
+-    let readable: Bool
+-    let elements: [AXUIElement]
+-}
+-
+ extension MissionReader {
+-    // Snapshot identities only, before Quit. An unreadable baseline disables
+-    // automatic focus, never the close request itself.
+-    func dialogBaseline(for target: AppTarget) -> DialogBaseline {
+-        let root = AXUIElementCreateApplication(target.pid)
+-        AXUIElementSetMessagingTimeout(root, 0.1)
+-        var raw: CFTypeRef?
+-        guard AXUIElementCopyAttributeValue(root, kAXWindowsAttribute as CFString, &raw) == .success,
+-              let windows = raw as? [AXUIElement] else { return DialogBaseline(readable: false, elements: []) }
+-        let deadline = ProcessInfo.processInfo.systemUptime + 0.25
+-        var elements = windows
+-        for window in windows {
+-            guard ProcessInfo.processInfo.systemUptime < deadline else { return DialogBaseline(readable: false, elements: []) }
+-            elements += AX.elements(window, "AXSheets") + AX.elements(window)
+-        }
+-        return DialogBaseline(readable: true, elements: elements)
+-    }
+-    // No titles or button labels are guessed. Sheets must belong to the target
+-    // window; app-wide Quit may also produce a separate modal window of that app.
++    // Observe real blocking UI only after an accepted close request. A dialog
++    // need not have a new AX identity: Office may reuse an existing UI object.
+     func dialogs(for target: AppTarget, wholeApp: Bool) -> [BlockingDialog] {
+         let root = AXUIElementCreateApplication(target.pid)
+-        AXUIElementSetMessagingTimeout(root, 0.15)
+-        var raw: CFTypeRef?
+-        guard AXUIElementCopyAttributeValue(root, kAXWindowsAttribute as CFString, &raw) == .success,
+-              let windows = raw as? [AXUIElement] else { return [] }
++        let rootData = AX.attributes(root, [kAXWindowsAttribute, kAXFocusedWindowAttribute, kAXFocusedUIElementAttribute], timeout: 0.12)
++        let windows = rootData[kAXWindowsAttribute] as? [AXUIElement] ?? []
++        let focusedWindow = AX.asElement(rootData[kAXFocusedWindowAttribute])
++        let deadline = ProcessInfo.processInfo.systemUptime + 0.3
+         var found: [BlockingDialog] = []
+-        let deadline = ProcessInfo.processInfo.systemUptime + 0.3
+-        func append(_ element: AXUIElement, window: AXUIElement) {
++        func belongs(_ window: AXUIElement) -> Bool {
++            wholeApp || AX.windowID(window).map { target.windowIDs.contains($0) } == true
++        }
++        func append(_ node: AXUIElement, window: AXUIElement, data: [String: CFTypeRef], focused: Bool) {
+             var pid: pid_t = 0
+-            guard AXUIElementGetPid(element, &pid) == .success, pid == target.pid,
+-                  DialogRules.isBlocking(role: AX.text(element, kAXRoleAttribute),
+-                    modal: (AX.value(element, kAXModalAttribute) as? Bool) == true),
+-                  !found.contains(where: { CFEqual($0.element, element) }) else { return }
+-            found.append(BlockingDialog(element: element, window: window))
++            guard AXUIElementGetPid(node, &pid) == .success, pid == target.pid,
++                  (data["AXHidden"] as? Bool) != true,
++                  DialogRules.isBlocking(role: data[kAXRoleAttribute] as? String ?? "",
++                    modal: data[kAXModalAttribute] as? Bool,
++                    subrole: data[kAXSubroleAttribute] as? String ?? "", focused: focused),
++                  !found.contains(where: { CFEqual($0.element, node) }) else { return }
++            found.append(BlockingDialog(element: node, window: window, focusedSemantic: focused))
+         }
+-        for window in windows {
+-            guard ProcessInfo.processInfo.systemUptime < deadline else { break }
+-            let belongsToTarget = AX.windowID(window).map { target.windowIDs.contains($0) } ?? false
+-            guard wholeApp || belongsToTarget else { continue }
+-            append(window, window: window)
+-            let sheets = AX.elements(window, "AXSheets")
+-                + AX.elements(window).filter { AX.text($0, kAXRoleAttribute) == kAXSheetRole }
+-            for sheet in sheets { append(sheet, window: window) }
++        func visitWindow(_ window: AXUIElement, focused: Bool) {
++            guard belongs(window), ProcessInfo.processInfo.systemUptime < deadline else { return }
++            let data = AX.attributes(window, [kAXRoleAttribute, kAXSubroleAttribute, kAXModalAttribute, kAXWindowAttribute, "AXSheets", "AXHidden"])
++            let parent = data[kAXRoleAttribute] as? String == kAXSheetRole ? AX.asElement(data[kAXWindowAttribute]) ?? window : window
++            append(window, window: parent, data: data, focused: focused)
++            for sheet in (data["AXSheets"] as? [AXUIElement] ?? []) {
++                guard ProcessInfo.processInfo.systemUptime < deadline else { break }
++                append(sheet, window: window, data: AX.attributes(sheet,
++                    [kAXRoleAttribute, kAXSubroleAttribute, kAXModalAttribute, "AXHidden"]), focused: focused)
++                if !found.isEmpty { break }
++            }
++        }
++        if let focusedWindow { visitWindow(focusedWindow, focused: true) }
++        if !found.isEmpty { return found }
++        // A custom Office prompt may be nested under an AXGroup, not AXSheets.
++        // Follow the focused control's parents; never traverse the document tree.
++        var node = AX.asElement(rootData[kAXFocusedUIElementAttribute])
++        var seen: Set<UInt> = []
++        let ancestryDeadline = min(deadline, ProcessInfo.processInfo.systemUptime + 0.12)
++        for _ in 0..<8 {
++            guard let current = node, seen.insert(CFHash(current)).inserted,
++                  ProcessInfo.processInfo.systemUptime < ancestryDeadline else { break }
++            let data = AX.attributes(current, [kAXRoleAttribute, kAXSubroleAttribute, kAXModalAttribute,
++                kAXParentAttribute, kAXWindowAttribute, "AXHidden"])
++            let role = data[kAXRoleAttribute] as? String ?? ""
++            if let window = role == kAXWindowRole ? current : AX.asElement(data[kAXWindowAttribute]), belongs(window) {
++                append(current, window: window, data: data, focused: true)
++                if !found.isEmpty { return found }
++            }
++            if role == kAXWindowRole { break }
++            node = AX.asElement(data[kAXParentAttribute])
++        }
++        // Rotate through other windows so a long list cannot permanently hide
++        // a prompt near its end behind a per-scan time budget.
++        if !windows.isEmpty {
++            let start = dialogScanOffsets[target.pid, default: 0] % windows.count
++            for step in 0..<windows.count {
++                guard ProcessInfo.processInfo.systemUptime < deadline else { break }
++                let index = (start + step) % windows.count
++                dialogScanOffsets[target.pid] = (index + 1) % windows.count
++                let window = windows[index]
++                if let focusedWindow, CFEqual(window, focusedWindow) { continue }
++                visitWindow(window, focused: false)
++                if !found.isEmpty { break }
++            }
+         }
+         return found
+     }
+ 
+-    func raiseDialog(_ dialog: BlockingDialog, target: AppTarget) {
++    func dialogIsPresent(_ dialog: BlockingDialog, target: AppTarget) -> Bool {
+         var pid: pid_t = 0
++        let data = AX.attributes(dialog.element, [kAXRoleAttribute, kAXSubroleAttribute, kAXModalAttribute, "AXHidden"])
+         guard AXUIElementGetPid(dialog.element, &pid) == .success, pid == target.pid,
+               let app = NSRunningApplication(processIdentifier: target.pid),
+               app.bundleIdentifier == target.bundleID, !app.isTerminated,
+-              DialogRules.isBlocking(role: AX.text(dialog.element, kAXRoleAttribute),
+-                modal: (AX.value(dialog.element, kAXModalAttribute) as? Bool) == true) else { return }
++              (data["AXHidden"] as? Bool) != true,
++              DialogRules.isBlocking(role: data[kAXRoleAttribute] as? String ?? "",
++                modal: data[kAXModalAttribute] as? Bool,
++                subrole: data[kAXSubroleAttribute] as? String ?? "", focused: dialog.focusedSemantic) else { return false }
++        return true
++    }
++
++    func raiseDialog(_ dialog: BlockingDialog, target: AppTarget) {
++        guard dialogIsPresent(dialog, target: target) else { return }
+         let root = AXUIElementCreateApplication(target.pid)
+         AXUIElementSetMessagingTimeout(root, 0.15)
++        AXUIElementSetMessagingTimeout(dialog.window, 0.15)
++        AXUIElementSetMessagingTimeout(dialog.element, 0.15)
+         _ = AXUIElementPerformAction(dialog.window, kAXRaiseAction as CFString)
+         _ = AXUIElementSetAttributeValue(root, kAXFocusedWindowAttribute as CFString, dialog.window)
+         _ = AXUIElementPerformAction(dialog.element, kAXRaiseAction as CFString)
+--- a/Sources/Model.swift
++++ b/Sources/Model.swift
+@@ -15,6 +15,11 @@
+ }
+ 
+ enum LayoutRules {
++    // Measure each remote element once; sorting itself performs no AX calls.
++    static func measureAndSort<Item>(_ items: [Item], measure: (Item) -> CGRect?) -> [(item: Item, frame: CGRect)] {
++        items.compactMap { item in measure(item).map { (item: item, frame: $0) } }
++            .sorted { $0.frame.minX < $1.frame.minX }
++    }
+     // Mission Control's space buttons expose a center anchor as AXPosition on
+     // the tested Dock implementation. Ordinary AX windows use a top-left origin.
+     static func spaceFrame(center: CGPoint, size: CGSize) -> CGRect {
+@@ -44,6 +49,29 @@
+ 
+     static func cocoaFrame(_ quartz: CGRect, primaryTop: CGFloat) -> CGRect {
+         CGRect(x: quartz.minX, y: primaryTop - quartz.maxY, width: quartz.width, height: quartz.height)
++    }
++}
++
++// Decode the expensive window dictionaries once per catalog refresh, then use
++// window-ID lookups for all Spaces instead of decoding every row for every Space.
++struct WindowCatalog {
++    private let windows: [CGWindowID: pid_t]
++    init(rows: [[String: Any]]) {
++        var indexed: [CGWindowID: pid_t] = [:]
++        for row in rows {
++            guard let id = row[kCGWindowNumber as String] as? NSNumber,
++                  let pid = row[kCGWindowOwnerPID as String] as? NSNumber,
++                  let layer = row[kCGWindowLayer as String] as? NSNumber, layer.intValue == 0,
++                  let bounds = row[kCGWindowBounds as String] as? NSDictionary,
++                  let frame = CGRect(dictionaryRepresentation: bounds), frame.width >= 150, frame.height >= 100 else { continue }
++            indexed[id.uint32Value] = pid.int32Value
++        }
++        windows = indexed
++    }
++    func owners(of ids: Set<CGWindowID>) -> [pid_t: Set<CGWindowID>] {
++        var grouped: [pid_t: Set<CGWindowID>] = [:]
++        for id in ids { if let pid = windows[id] { grouped[pid, default: []].insert(id) } }
++        return grouped
+     }
+ }
+ 
+@@ -93,8 +121,13 @@
+ }
+ 
+ enum DialogRules {
+-    static func isBlocking(role: String, modal: Bool) -> Bool {
+-        role == "AXSheet" || (role == "AXWindow" && modal)
++    static func isBlocking(role: String, modal: Bool?, subrole: String = "", focused: Bool = false) -> Bool {
++        if role == "AXSheet" { return true }
++        if modal == true { return role == "AXWindow" || subrole == "AXDialog" || subrole == "AXSystemDialog" }
++        if modal == false { return false }
++        // Missing modality alone is insufficient. A focused semantic dialog is
++        // accepted, but an ordinary focused document window never is.
++        return focused && (role == "AXDialog" || subrole == "AXDialog" || subrole == "AXSystemDialog")
+     }
+ }
+ 
+--- a/Sources/SelfTests.swift
++++ b/Sources/SelfTests.swift
+@@ -149,6 +149,17 @@
+     check(DialogRules.isBlocking(role: "AXWindow", modal: true), "Separaten Dialog erkennen")
+     check(!DialogRules.isBlocking(role: "AXWindow", modal: false),
+         "Normales App-Fenster ist kein Speichern-Dialog")
++    check(DialogRules.isBlocking(role: "AXGroup", modal: nil, subrole: "AXDialog", focused: true),
++        "Fokussierter semantischer Office-Dialog ohne Modal-Attribut wird erkannt")
++    check(!DialogRules.isBlocking(role: "AXWindow", modal: nil, focused: true),
++        "Fokussiertes normales Dokument ohne Modal-Attribut wird nicht aktiviert")
++    check(!DialogRules.isBlocking(role: "AXWindow", modal: false, subrole: "AXDialog", focused: true),
++        "Explizit nichtmodaler Suchdialog löst keinen erzwungenen Fensterwechsel aus")
++    check(!DialogRules.isBlocking(role: "AXGroup", modal: nil, subrole: "AXDialog", focused: false),
++        "Unsicheres nicht fokussiertes Dialogobjekt ohne Modalität wird nicht geraten")
++    var reused = CloseProgress()
++    check(reused.observe(pending: true, dialogs: [42], elapsed: 0.3) == .focus(42),
++        "Echte Rückfrage darf dieselbe AX-Kennung wie eine frühere UI verwenden")
+     let primary = ScreenRecord(id: 1, uuid: "physical-1", frame: screen)
+     let secondary = ScreenRecord(id: 2, uuid: "physical-2", frame: second)
+     check(ScreenRecord.matching([primary, secondary], displayID: nil, point: CGPoint(x: 300, y: 50))?.id == 1,
+@@ -159,6 +170,61 @@
+         "Explizit falsche Display-ID wird nicht überschrieben")
+     check(ScreenRecord.matching([primary, primary], displayID: nil, point: CGPoint(x: 300, y: 50)) == nil,
+         "Mehrdeutige Anzeige wird nicht geraten")
++    var reads = 0
++    let sorted = LayoutRules.measureAndSort(Array((0..<40).reversed())) { item in
++        reads += 1
++        return CGRect(x: item * 50, y: 0, width: 40, height: 30)
++    }
++    check(reads == 40, "Vierzig Kacheln werden genau vierzig Mal vermessen, nicht im Sortiervergleich")
++    check(sorted.map(\.item) == Array(0..<40), "Lokale Sortierung erhält korrekte Leistenreihenfolge")
++    let filtered = LayoutRules.measureAndSort([1, 2, 3]) { $0 == 2 ? nil : CGRect(x: $0 * 50, y: 0, width: 40, height: 30) }
++    check(filtered.count == 2, "Nicht lesbare Kachel erzeugt keinen erfundenen Rahmen")
++    check(LayoutRules.map(spaces: [desktop, fullscreen, SpaceRecord(id: 8, type: 4)],
++        frames: filtered.map(\.frame), screen: screen) == nil, "Unvollständig gemessene Leiste bleibt geschützt")
++    let catalog = WindowCatalog(rows: [
++        benchmarkRow(id: 1, pid: 10), benchmarkRow(id: 2, pid: 10), benchmarkRow(id: 3, pid: 11),
++        benchmarkRow(id: 4, pid: 12, layer: 24), benchmarkRow(id: 5, pid: 13, width: 28)
++    ])
++    check(catalog.owners(of: [1, 2, 3, 4, 5, 99]) == [10: [1, 2], 11: [3]],
++        "Einmalig erstellter Fensterindex bewahrt Prozesszuordnung und filtert Leisten/Overlays")
++    check(catalog.owners(of: [2]) == [10: [2]], "Index verwendet nur Fenster des jeweils abgefragten Spaces")
++    check(catalog.owners(of: []).isEmpty, "Leerer Space erbt keine Fenster aus dem Index")
+     print("\(passed) Prüfungen bestanden.")
+ }
+ 
++private func benchmarkRow(id: Int, pid: Int, layer: Int = 0, width: Int = 1000) -> [String: Any] {
++    [kCGWindowNumber as String: NSNumber(value: id), kCGWindowOwnerPID as String: NSNumber(value: pid),
++     kCGWindowLayer as String: NSNumber(value: layer), kCGWindowBounds as String:
++        CGRect(x: 0, y: 0, width: width, height: 800).dictionaryRepresentation]
++}
++
++func runCatalogBenchmark() {
++    let rows = (1...2000).map { benchmarkRow(id: $0, pid: $0 % 50 + 100, layer: $0 % 9 == 0 ? 24 : 0) }
++    let memberships = (0..<40).map { space in Set((1...2000).filter { $0 % 40 == space }.map { CGWindowID($0) }) }
++    let iterations = 20
++    var oldCount = 0, indexedCount = 0
++    var start = ProcessInfo.processInfo.systemUptime
++    for _ in 0..<iterations {
++        for ids in memberships {
++            for row in rows {
++                guard let id = row[kCGWindowNumber as String] as? NSNumber, ids.contains(id.uint32Value),
++                      let layer = row[kCGWindowLayer as String] as? NSNumber, layer.intValue == 0,
++                      let bounds = row[kCGWindowBounds as String] as? NSDictionary,
++                      let rect = CGRect(dictionaryRepresentation: bounds), rect.width >= 150, rect.height >= 100 else { continue }
++                oldCount += 1
++            }
++        }
++    }
++    let oldTime = ProcessInfo.processInfo.systemUptime - start
++    start = ProcessInfo.processInfo.systemUptime
++    for _ in 0..<iterations {
++        let catalog = WindowCatalog(rows: rows)
++        for ids in memberships { indexedCount += catalog.owners(of: ids).values.reduce(0) { $0 + $1.count } }
++    }
++    let newTime = ProcessInfo.processInfo.systemUptime - start
++    guard oldCount == indexedCount else { fputs("Benchmark-Ergebnisse weichen ab.\n", stderr); exit(1) }
++    print("Synthetischer Fensterindex-Test: 2000 Fenster, 40 Spaces, \(iterations) Durchläufe")
++    print(String(format: "Vorher: %.1f ms; Index: %.1f ms; Faktor: %.2f; gleiche Treffer: %d", oldTime * 1000, newTime * 1000, oldTime / max(newTime, 0.000001), oldCount))
++    print("Misst nur Metadatenverarbeitung, keine reale Mission-Control-Einblendzeit.")
++}
++
+--- a/Sources/Settings.swift
++++ b/Sources/Settings.swift
+@@ -116,7 +116,7 @@
+             .formStyle(.grouped)
+             Divider()
+             HStack {
+-                Text("Version 0.5.0 · Testversion").font(.caption).foregroundStyle(.secondary)
++                Text("Version 0.5.1 · Testversion").font(.caption).foregroundStyle(.secondary)
+                 Spacer()
+                 Button("SpaceClose beenden") { preferences.onQuit?() }
+             }
+--- a/Sources/SystemAccess.swift
++++ b/Sources/SystemAccess.swift
+@@ -96,6 +96,7 @@
+ 
+ enum AX {
+     static func value(_ element: AXUIElement, _ key: String) -> CFTypeRef? {
++        AXUIElementSetMessagingTimeout(element, 0.08)
+         var result: CFTypeRef?
+         guard AXUIElementCopyAttributeValue(element, key as CFString, &result) == .success else { return nil }
+         return result
+@@ -106,25 +107,52 @@
+     static func elements(_ element: AXUIElement, _ key: String = kAXChildrenAttribute) -> [AXUIElement] {
+         value(element, key) as? [AXUIElement] ?? []
+     }
++    static func asElement(_ raw: CFTypeRef?) -> AXUIElement? {
++        guard let raw, CFGetTypeID(raw) == AXUIElementGetTypeID() else { return nil }
++        return (raw as! AXUIElement)
++    }
+     static func element(_ element: AXUIElement, _ key: String) -> AXUIElement? {
+         guard let raw = value(element, key), CFGetTypeID(raw) == AXUIElementGetTypeID() else { return nil }
+         return (raw as! AXUIElement)
+     }
+-    static func frame(_ element: AXUIElement) -> CGRect? {
+-        guard let p = value(element, kAXPositionAttribute), CFGetTypeID(p) == AXValueGetTypeID(),
+-              let s = value(element, kAXSizeAttribute), CFGetTypeID(s) == AXValueGetTypeID() else { return nil }
++    static func attributes(_ element: AXUIElement, _ keys: [String], timeout: Float = 0.08) -> [String: CFTypeRef] {
++        AXUIElementSetMessagingTimeout(element, timeout)
++        var raw: CFArray?
++        let error = AXUIElementCopyMultipleAttributeValues(element, keys as CFArray,
++            AXCopyMultipleAttributeOptions(rawValue: 0), &raw)
++        guard error == .success, let values = raw as? [CFTypeRef], values.count == keys.count else {
++            // Older third-party AX bridges may not implement the bulk call.
++            if error == .notImplemented { return Dictionary(uniqueKeysWithValues: keys.compactMap { key in value(element, key).map { (key, $0) } }) }
++            return [:]
++        }
++        var result: [String: CFTypeRef] = [:]
++        for (key, item) in zip(keys, values) {
++            if CFGetTypeID(item) == AXValueGetTypeID(), AXValueGetType(item as! AXValue) == .axError { continue }
++            result[key] = item
++        }
++        return result
++    }
++    static func frame(_ attributes: [String: CFTypeRef]) -> CGRect? {
++        guard let p = attributes[kAXPositionAttribute], CFGetTypeID(p) == AXValueGetTypeID(),
++              let s = attributes[kAXSizeAttribute], CFGetTypeID(s) == AXValueGetTypeID() else { return nil }
+         var point = CGPoint.zero
+         var size = CGSize.zero
+         guard AXValueGetValue(p as! AXValue, .cgPoint, &point),
+               AXValueGetValue(s as! AXValue, .cgSize, &size) else { return nil }
+         return CGRect(origin: point, size: size)
+     }
++    static func frame(_ element: AXUIElement) -> CGRect? {
++        frame(attributes(element, [kAXPositionAttribute, kAXSizeAttribute]))
++    }
++    private typealias GetWindow = @convention(c) (AXUIElement, UnsafeMutablePointer<CGWindowID>) -> AXError
++    private static let getWindow: GetWindow? = {
++        guard let handle = dlopen("/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices", RTLD_LAZY),
++              let pointer = dlsym(handle, "_AXUIElementGetWindow") else { return nil }
++        return unsafeBitCast(pointer, to: GetWindow.self)
++    }()
+     static func windowID(_ window: AXUIElement) -> CGWindowID? {
+-        typealias GetWindow = @convention(c) (AXUIElement, UnsafeMutablePointer<CGWindowID>) -> AXError
+-        guard let handle = dlopen("/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices", RTLD_LAZY),
+-              let symbol = dlsym(handle, "_AXUIElementGetWindow") else { return nil }
+-        defer { dlclose(handle) }
+-        let getWindow = unsafeBitCast(symbol, to: GetWindow.self)
++        AXUIElementSetMessagingTimeout(window, 0.08)
++        guard let getWindow else { return nil }
+         var id: CGWindowID = 0
+         return getWindow(window, &id) == .success && id != 0 ? id : nil
+     }
+@@ -158,6 +186,7 @@
+ 
+ final class MissionReader {
+     let spaces = SpaceReader()
++    var dialogScanOffsets: [pid_t: Int] = [:]
+     private var owners: [NSRunningApplication] = []
+     private var lastOwnerRefresh: TimeInterval = 0
+ 
+@@ -165,7 +194,15 @@
+         let displayID: CGDirectDisplayID?
+         let buttons: [AXUIElement]
+     }
+-    // Apple moved parts of Mission Control from Dock to WindowManager in macOS 27.
++    private struct ListPath {
++        let owner: pid_t
++        let nodes: [AXUIElement]
++        let display: CGDirectDisplayID?
++    }
++    private var listPaths: [ListPath] = []
++    func invalidateLayoutCache() { listPaths.removeAll(); targetCacheTime = -10 }
++    // Reuse only paths whose parent/child links still exist in the current AX
++    // tree. A cached rectangle alone is never evidence of visible Mission Control.
+     func lists() -> [SpaceList] {
+         let now = ProcessInfo.processInfo.systemUptime
+         if now - lastOwnerRefresh > 3 || owners.isEmpty || owners.contains(where: \.isTerminated) {
+@@ -175,26 +212,54 @@
+             }
+             lastOwnerRefresh = now
+         }
++        if !listPaths.isEmpty {
++            var cached: [SpaceList] = []
++            for path in listPaths {
++                var parent = AXUIElementCreateApplication(path.owner)
++                var valid = true
++                for child in path.nodes {
++                    if !AX.elements(parent).contains(where: { CFEqual($0, child) }) { valid = false; break }
++                    parent = child
++                }
++                guard valid else { cached.removeAll(); break }
++                let buttons = AX.elements(parent)
++                guard !buttons.isEmpty else { cached.removeAll(); break }
++                cached.append(SpaceList(displayID: path.display, buttons: buttons))
++            }
++            if cached.count == listPaths.count { return cached }
++            listPaths.removeAll()
++        }
+         var found: [SpaceList] = []
++        // Breadth first: do not walk every Dock icon before reaching the mc root.
+         for owner in owners {
+             let root = AXUIElementCreateApplication(owner.processIdentifier)
+-            AXUIElementSetMessagingTimeout(root, 0.12)
+-            var budget = 350
+-            func visit(_ node: AXUIElement, depth: Int, displayID: CGDirectDisplayID?) {
+-                guard depth < 9, budget > 0 else { return }
+-                budget -= 1
+-                let identifier = AX.text(node, kAXIdentifierAttribute)
+-                let display = (AX.value(node, "AXDisplayID") as? NSNumber)?.uint32Value ?? displayID
++            var queue: [(AXUIElement, [AXUIElement], CGDirectDisplayID?)] = [(root, [], nil)]
++            var head = 0
++            let deadline = ProcessInfo.processInfo.systemUptime + 0.2
++            while head < queue.count && head < 120 && ProcessInfo.processInfo.systemUptime < deadline {
++                let (node, route, inheritedDisplay) = queue[head]; head += 1
++                let data = AX.attributes(node, [kAXIdentifierAttribute, "AXDisplayID", kAXRoleAttribute], timeout: 0.04)
++                let identifier = data[kAXIdentifierAttribute] as? String ?? ""
++                let display = (data["AXDisplayID"] as? NSNumber)?.uint32Value ?? inheritedDisplay
+                 if identifier == "mc.spaces.list" {
+-                    let buttons = AX.elements(node).filter { AX.text($0, kAXRoleAttribute) == kAXButtonRole }
+-                    if !buttons.isEmpty { found.append(SpaceList(displayID: display, buttons: buttons)) }
+-                    return
++                    let children = AX.elements(node)
++                    if !children.isEmpty {
++                        found.append(SpaceList(displayID: display, buttons: children))
++                        listPaths.append(ListPath(owner: owner.processIdentifier, nodes: route, display: display))
++                    }
++                    continue
+                 }
+-                // Do not descend into individual app icons or window previews.
+-                if identifier == "mc.windows" || identifier == "mc.spaces.add" { return }
+-                for child in AX.elements(node) { visit(child, depth: depth + 1, displayID: display) }
+-            }
+-            visit(root, depth: 0, displayID: nil)
++                if identifier == "mc.windows" || identifier == "mc.spaces.add" { continue }
++                let role = data[kAXRoleAttribute] as? String ?? ""
++                if role == "AXDockItem" { continue }
++                if owner.bundleIdentifier == "com.apple.dock", role == kAXListRole,
++                   !identifier.hasPrefix("mc"), !route.isEmpty { continue }
++                guard route.count < 8 else { continue }
++                let children = AX.elements(node)
++                let next = children.map { ($0, route + [$0], display) }
++                if identifier == "mc" || identifier.hasPrefix("mc.") { queue.insert(contentsOf: next, at: head) }
++                else { queue.append(contentsOf: next) }
++            }
+         }
+         return found
+     }
+@@ -203,21 +268,13 @@
+         let tiles: [CloseTile]
+         let message: String
+     }
+-    func targets(in spaceID: UInt64, info: [[String: Any]]? = nil) -> [AppTarget] {
++    private var targetCache: [UInt64: [AppTarget]] = [:]
++    private var targetCacheTime: TimeInterval = -10
++    func targets(in spaceID: UInt64, catalog: WindowCatalog? = nil) -> [AppTarget] {
+         let ids = spaces.windowIDs(in: spaceID)
+-        let rows = info ?? ((CGWindowListCopyWindowInfo([.optionAll, .excludeDesktopElements], kCGNullWindowID)
++        let catalog = catalog ?? WindowCatalog(rows: (CGWindowListCopyWindowInfo([.optionAll, .excludeDesktopElements], kCGNullWindowID)
+             as? [[String: Any]]) ?? [])
+-        var byPID: [pid_t: Set<CGWindowID>] = [:]
+-        for row in rows {
+-            guard let id = row[kCGWindowNumber as String] as? NSNumber, ids.contains(id.uint32Value),
+-                  let pid = row[kCGWindowOwnerPID as String] as? NSNumber,
+-                  let layer = row[kCGWindowLayer as String] as? NSNumber, layer.intValue == 0,
+-                  let bounds = row[kCGWindowBounds as String] as? NSDictionary,
+-                  let frame = CGRect(dictionaryRepresentation: bounds),
+-                  frame.width >= 150, frame.height >= 100 else { continue }
+-            byPID[pid.int32Value, default: []].insert(id.uint32Value)
+-        }
+-        return byPID.compactMap { pid, ids -> AppTarget? in
++        return catalog.owners(of: ids).compactMap { pid, ids -> AppTarget? in
+             guard pid != getpid(), let app = NSRunningApplication(processIdentifier: pid),
+                   app.activationPolicy == .regular, !app.isTerminated,
+                   let bundle = app.bundleIdentifier else { return nil }
+@@ -245,9 +302,15 @@
+         let displays = spaces.readDisplays()
+         var result: [MappedList] = []
+         for list in lists {
+-            let ordered = list.buttons.sorted { (AX.spaceFrame($0)?.minX ?? 0) < (AX.spaceFrame($1)?.minX ?? 0) }
+-            let frames = ordered.compactMap(AX.spaceFrame)
+-            guard frames.count == ordered.count, let first = frames.first else { continue }
++            let measured = LayoutRules.measureAndSort(list.buttons) { button -> CGRect? in
++                let data = AX.attributes(button, [kAXPositionAttribute, kAXSizeAttribute, kAXRoleAttribute])
++                guard data[kAXRoleAttribute] as? String == kAXButtonRole,
++                      let raw = AX.frame(data) else { return nil }
++                return LayoutRules.spaceFrame(center: raw.origin, size: raw.size)
++            }
++            guard let first = measured.first?.frame else { continue }
++            let ordered = measured.map(\.item)
++            let frames = measured.map(\.frame)
+             let screen = ScreenRecord.matching(screens, displayID: list.displayID,
+                 point: CGPoint(x: first.midX, y: first.midY))
+             guard let screen, !result.contains(where: { $0.screen.id == screen.id }),
+@@ -266,11 +329,19 @@
+         guard !lists.isEmpty else {
+             return Snapshot(tiles: [], message: "Bereit – Mission Control öffnen")
+         }
+-        let info = CGWindowListCopyWindowInfo([.optionAll, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
++        let mappedLists = self.mappedLists(screens: screens, lists: lists)
++        let ids = Set(mappedLists.flatMap { $0.layout.filter { $0.space.type == 4 }.map { $0.space.id } })
++        let now = ProcessInfo.processInfo.systemUptime
++        if ids.isEmpty { targetCache.removeAll(); return Snapshot(tiles: [], message: "Leiste erkannt – keine aufgeklappte Vollbild-Kachel") }
++        if Set(targetCache.keys) != ids || now - targetCacheTime >= 0.6 {
++            let catalog = WindowCatalog(rows: CGWindowListCopyWindowInfo([.optionAll, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? [])
++            targetCache = Dictionary(uniqueKeysWithValues: ids.map { ($0, targets(in: $0, catalog: catalog)) })
++            targetCacheTime = now
++        }
+         var tiles: [CloseTile] = []
+-        for mapped in mappedLists(screens: screens, lists: lists) {
++        for mapped in mappedLists {
+             for tile in mapped.layout where tile.space.type == 4 {
+-                let targets = targets(in: tile.space.id, info: info)
++                let targets = targetCache[tile.space.id] ?? []
+                 if !targets.isEmpty { tiles.append(CloseTile(displayID: mapped.screen.id, layout: tile, targets: targets)) }
+             }
+         }
+@@ -289,6 +360,7 @@
+         }
+         guard candidates.count == 1, let window = candidates.values.first,
+               let button = AX.element(window, kAXCloseButtonAttribute) else { return false }
++        AXUIElementSetMessagingTimeout(button, 0.25)
+         let result = AXUIElementPerformAction(button, kAXPressAction as CFString)
+         // A modal close confirmation can outlive AX's response timeout. Observe
+         // the actual result/dialog instead of treating that timeout as a refusal.
+@@ -328,6 +400,7 @@
+               let index = mapped.display.spaces.firstIndex(of: tile.layout.space) else { return .unavailable }
+         let button = mapped.buttons[index]
+         var actions: CFArray?
++        AXUIElementSetMessagingTimeout(button, 0.12)
+         guard AXUIElementCopyActionNames(button, &actions) == .success,
+               (actions as? [String])?.contains("AXRemoveDesktop") == true,
+               hasTargetWindow(target) == false, targets(in: tile.layout.space.id).isEmpty else { return .unavailable }
+--- a/Sources/main.swift
++++ b/Sources/main.swift
+@@ -34,6 +34,8 @@
+ final class Overlay {
+     let panel: NSPanel
+     let spaces: SpaceReader
++    private var previewReady = false
++    private var label = ""
+     let mark = CloseMark(frame: NSRect(x: 0, y: 0, width: 28, height: 28))
+     init(spaces: SpaceReader) {
+         self.spaces = spaces
+@@ -50,6 +52,8 @@
+         panel.collectionBehavior = [.moveToActiveSpace, .stationary, .ignoresCycle, .fullScreenNone]
+         panel.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.screenSaverWindow)) + 1)
+         panel.contentView = mark
++        mark.setAccessibilityElement(true)
++        mark.setAccessibilityRole(.button)
+         _ = spaces.excludeOwnOverlayFromPreviews(windowID: CGWindowID(panel.windowNumber))
+     }
+     func show(_ tile: CloseTile, primaryTop: CGFloat, behavior: CloseBehavior) -> Bool {
+@@ -57,16 +61,20 @@
+         if panel.frame != frame { panel.setFrame(frame, display: true, animate: false) }
+         // WindowServer commits the tags asynchronously. Do not show/click a new
+         // panel until a later run-loop pass can read back the exclusion flags.
+-        guard spaces.ownOverlayIsExcluded(windowID: CGWindowID(panel.windowNumber)) else {
+-            panel.orderOut(nil)
+-            _ = spaces.excludeOwnOverlayFromPreviews(windowID: CGWindowID(panel.windowNumber))
+-            return false
++        if !previewReady {
++            previewReady = spaces.ownOverlayIsExcluded(windowID: CGWindowID(panel.windowNumber))
++            if !previewReady {
++                panel.orderOut(nil)
++                _ = spaces.excludeOwnOverlayFromPreviews(windowID: CGWindowID(panel.windowNumber))
++                return false
++            }
+         }
+         let title = tile.targets.count == 1 ? "\(tile.targets[0].name): \(behavior.title)" : "App zum Schließen auswählen"
+-        mark.toolTip = title
+-        mark.setAccessibilityElement(true)
+-        mark.setAccessibilityRole(.button)
+-        mark.setAccessibilityLabel(title)
++        if label != title {
++            label = title
++            mark.toolTip = title
++            mark.setAccessibilityLabel(title)
++        }
+         if !panel.isVisible { panel.orderFrontRegardless() }
+         return true
+     }
+@@ -83,6 +91,8 @@
+ 
+ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+     let reader = MissionReader()
++    let closingReader = MissionReader()
++    let layoutWorker = DispatchQueue(label: "local.spaceclose.layout", qos: .userInitiated)
+     let worker = DispatchQueue(label: "local.spaceclose.reader", qos: .userInitiated)
+     let clicks = ClickRouter()
+     let preferences = Preferences()
+@@ -144,6 +154,8 @@
+     @objc func screenChanged() {
+         refreshEpoch &+= 1
+         hide()
++        layoutWorker.async { self.reader.invalidateLayoutCache() }
++        worker.async { self.closingReader.invalidateLayoutCache() }
+         suppressUntil = ProcessInfo.processInfo.systemUptime + 0.45
+     }
+     func makeStatusMenu() {
+@@ -200,7 +212,7 @@
+         pauseItem.state = enabled ? .on : .off
+     }
+     func setStatus(_ message: String) {
+-        statusLine.title = message
++        if statusLine.title != message { statusLine.title = message }
+         if preferences.status != message { preferences.status = message }
+     }
+     @objc func quit() { NSApp.terminate(nil) }
+@@ -345,20 +357,18 @@
+         }
+         let now = ProcessInfo.processInfo.systemUptime
+         guard now >= suppressUntil else { return }
+-        let interval: TimeInterval = current.isEmpty ? 0.45 : 0.12
++        let interval: TimeInterval = current.isEmpty ? 0.2 : 0.12
+         guard !reading, now - lastRead >= interval, !menuVisible else { return }
+         lastRead = now
+         reading = true
+         let screens = ScreenRecord.capture()
+         let epoch = refreshEpoch
+-        let requestedAt = now
+-        worker.async { [weak self] in
++        layoutWorker.async { [weak self] in
+             guard let self else { return }
+             let snapshot = self.reader.snapshot(screens: screens)
+             DispatchQueue.main.async {
+                 self.reading = false
+-                guard epoch == self.refreshEpoch,
+-                      ProcessInfo.processInfo.systemUptime - requestedAt < 0.6 else { return }
++                guard epoch == self.refreshEpoch else { return }
+                 self.setStatus(snapshot.message)
+                 guard self.enabled, self.isTrusted, !self.actionInFlight,
+                       ProcessInfo.processInfo.systemUptime >= self.suppressUntil else { self.hide(); return }
+@@ -473,20 +483,19 @@
+         let inputEpoch = interactionEpoch
+         worker.async { [weak self] in
+             guard let self else { return }
+-            guard self.reader.isCurrentTarget(target, tile: tile, screenUUID: screenUUID) else {
++            guard self.closingReader.isCurrentTarget(target, tile: tile, screenUUID: screenUUID) else {
+                 DispatchQueue.main.async {
+                     self.actionInFlight = false
+                     self.setActionStatus("Kachel hat sich geändert – bitte erneut wählen.")
+                 }
+                 return
+             }
+-            let baseline = self.reader.dialogBaseline(for: target)
+             // Prevent generating a dead thumbnail: leave overview BEFORE asking
+             // the app to close. Failure to leave overview must never block Quit.
+-            let didHide = !self.reader.lists().isEmpty && self.reader.spaces.toggleMissionControl()
++            let didHide = !self.closingReader.lists().isEmpty && self.closingReader.spaces.toggleMissionControl()
+             self.worker.asyncAfter(deadline: .now() + (didHide ? 0.3 : 0)) {
+-                let overviewClosed = didHide && self.reader.lists().isEmpty
+-                let windowAccepted = windowOnly && self.reader.closeWindow(target: target)
++                let overviewClosed = didHide && self.closingReader.lists().isEmpty
++                let windowAccepted = windowOnly && self.closingReader.closeWindow(target: target)
+                 DispatchQueue.main.async {
+                     self.actionInFlight = false
+                     guard let app = NSRunningApplication(processIdentifier: target.pid),
+@@ -504,7 +513,7 @@
+                     let token = UUID()
+                     self.closeJobs[target.pid] = token
+                     self.monitorClose(tile: tile, target: target, wholeApp: !windowOnly,
+-                        baseline: baseline, token: token, progress: CloseProgress(),
++                        token: token, progress: CloseProgress(),
+                         started: ProcessInfo.processInfo.systemUptime,
+                         restore: overviewClosed, inputEpoch: inputEpoch)
+                 }
+@@ -512,17 +521,14 @@
+         }
+     }
+     func monitorClose(tile: CloseTile, target: AppTarget, wholeApp: Bool,
+-        baseline: DialogBaseline, token: UUID, progress: CloseProgress, started: TimeInterval,
++        token: UUID, progress: CloseProgress, started: TimeInterval,
+         restore: Bool, inputEpoch: UInt64) {
+         worker.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+             guard let self else { return }
+             let app = NSRunningApplication(processIdentifier: target.pid)
+             let running = app?.bundleIdentifier == target.bundleID && app?.isTerminated == false
+-            let pending = running && (wholeApp || self.reader.hasTargetWindow(target) != false)
+-            let dialogs = pending && baseline.readable
+-                ? self.reader.dialogs(for: target, wholeApp: wholeApp).filter { candidate in
+-                    !baseline.elements.contains { CFEqual($0, candidate.element) }
+-                } : []
++            let pending = running && (wholeApp || self.closingReader.hasTargetWindow(target) != false)
++            let dialogs = pending ? self.closingReader.dialogs(for: target, wholeApp: wholeApp) : []
+             DispatchQueue.main.async {
+                 guard self.closeJobs[target.pid] == token else { return }
+                 var next = progress
+@@ -543,18 +549,33 @@
+                     self.setActionStatus("Die App ist weiterhin offen. Es wurde kein Beenden erzwungen.")
+                     return
+                 case .focus(let id):
+-                    if let dialog = dialogs.first(where: { $0.id == id }), let app, !app.isTerminated {
++                    if let dialog = dialogs.first(where: { $0.id == id }) {
+                         self.setActionStatus("Rückfrage von \(target.name) erkannt – bitte beantworten.")
+-                        _ = app.activate(options: [.activateIgnoringOtherApps])
+-                        self.worker.asyncAfter(deadline: .now() + 0.1) {
+-                            self.reader.raiseDialog(dialog, target: target)
+-                        }
++                        self.focusDialog(dialog, target: target, token: token, inputEpoch: self.interactionEpoch)
+                     }
+                 case .waiting: break
+                 }
+-                self.monitorClose(tile: tile, target: target, wholeApp: wholeApp, baseline: baseline,
++                self.monitorClose(tile: tile, target: target, wholeApp: wholeApp,
+                     token: token, progress: next, started: started,
+                     restore: restore && !next.hasFocusedDialog, inputEpoch: inputEpoch)
++            }
++        }
++    }
++    func focusDialog(_ dialog: BlockingDialog, target: AppTarget, token: UUID, inputEpoch: UInt64, attempt: Int = 0) {
++        worker.async { [weak self] in
++            guard let self, self.closingReader.dialogIsPresent(dialog, target: target) else { return }
++            DispatchQueue.main.async {
++                guard self.closeJobs[target.pid] == token,
++                      let app = NSRunningApplication(processIdentifier: target.pid),
++                      app.bundleIdentifier == target.bundleID, !app.isTerminated else { return }
++                let activated = app.activate(options: [.activateIgnoringOtherApps])
++                self.worker.asyncAfter(deadline: .now() + 0.08) { self.closingReader.raiseDialog(dialog, target: target) }
++                if !activated && attempt < 2 {
++                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
++                        guard inputEpoch == self.interactionEpoch else { return }
++                        self.focusDialog(dialog, target: target, token: token, inputEpoch: inputEpoch, attempt: attempt + 1)
++                    }
++                }
+             }
+         }
+     }
+@@ -565,10 +586,10 @@
+     func returnToOverview(allowed: Bool, inputEpoch: UInt64) {
+         guard allowed, inputEpoch == interactionEpoch else { return }
+         worker.async { [weak self] in
+-            guard let self, self.reader.lists().isEmpty else { return }
++            guard let self, self.closingReader.lists().isEmpty else { return }
+             DispatchQueue.main.async {
+                 guard inputEpoch == self.interactionEpoch else { return }
+-                _ = self.reader.spaces.toggleMissionControl()
++                _ = self.closingReader.spaces.toggleMissionControl()
+             }
+         }
+     }
+@@ -579,16 +600,16 @@
+         // system process restart and no removal based on a stale thumbnail alone.
+         worker.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+             guard let self else { return }
+-            let result = self.reader.removeEmptyFullscreenSpace(tile, target: target, screens: screens)
++            let result = self.closingReader.removeEmptyFullscreenSpace(tile, target: target, screens: screens)
+             if result == .requested {
+                 self.worker.asyncAfter(deadline: .now() + 0.35) {
+-                    let remaining = self.reader.spaces.readDisplays().contains { $0.spaces.contains(tile.layout.space) }
++                    let remaining = self.closingReader.spaces.readDisplays().contains { $0.spaces.contains(tile.layout.space) }
+                     if remaining { DispatchQueue.main.async {
+                         self.setActionStatus("App geschlossen; der leere Vollbildbereich konnte noch nicht entfernt werden.")
+                     } }
+                 }
+             } else if result == .unavailable {
+-                let remaining = self.reader.spaces.readDisplays().contains { $0.spaces.contains(tile.layout.space) }
++                let remaining = self.closingReader.spaces.readDisplays().contains { $0.spaces.contains(tile.layout.space) }
+                 if remaining { DispatchQueue.main.async {
+                     self.setActionStatus("App geschlossen; Bereinigung der Vollbild-Kachel noch nicht bestätigt.")
+                 } }
+@@ -668,6 +689,8 @@
+     } else { fputs("Frische Prozessprüfung fehlgeschlagen.\n", stderr); exit(1) }
+ } else if CommandLine.arguments.contains("--self-test") {
+     runSelfTests()
++} else if CommandLine.arguments.contains("--benchmark-catalog") {
++    runCatalogBenchmark()
+ } else if CommandLine.arguments.contains("--system-check") {
+     let reader = SpaceReader()
+     let displays = reader.readDisplays()
